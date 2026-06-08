@@ -76,8 +76,16 @@ async function extraer({ anio, hastaMes }) {
     await page.goto(EFFI_URL, { waitUntil: "networkidle", timeout: 60000 });
     await page.fill('input[type="email"], input[name="email"], #email', EFFI_EMAIL);
     await page.fill('input[type="password"], input[name="password"], #password', EFFI_PASSWORD);
-    await page.click('button[type="submit"], input[type="submit"]');
-    await page.waitForTimeout(5000);
+    // Enviar el formulario: Enter suele bastar en casi cualquier login
+    await page.press('input[type="password"], input[name="password"], #password', "Enter");
+    await page.waitForTimeout(3000);
+    // Respaldo: si seguimos en la página de ingreso, buscar el botón por texto
+    if (page.url().includes("ingreso") || page.url().includes("login")) {
+      const btn = page.locator('button, input[type=submit], a.btn, a').filter({ hasText: /ingres|entrar|inicia|acceder/i }).first();
+      if (await btn.count()) { await btn.click({ timeout: 10000 }).catch(() => {}); }
+    }
+    // Esperar a que cargue el panel (sale de /ingreso)
+    await page.waitForTimeout(6000);
 
     // 2) Recorrer cada mes (ventas y compras)
     for (let mes = 1; mes <= hastaMes; mes++) {
