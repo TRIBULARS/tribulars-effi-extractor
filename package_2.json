@@ -1,0 +1,16 @@
+{
+  "name": "tribulars-effi-extractor",
+  "version": "1.0.0",
+  "description": "Extrae ventas y compras mensuales de Effi y las guarda en Supabase",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "postinstall": "npx playwright install chromium --with-deps"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "express": "^4.19.2",
+    "playwright": "^1.44.0"
+  }
+}
