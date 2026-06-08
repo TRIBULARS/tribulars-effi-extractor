@@ -106,9 +106,7 @@ app.use(express.json());
 app.get("/", (_req, res) => res.send("Extractor Effi activo"));
 
 app.post("/extraer", async (req, res) => {
-  if (EXTRACTOR_SECRET && req.headers["x-secret"] !== EXTRACTOR_SECRET) {
-    return res.status(401).json({ ok: false, error: "no autorizado" });
-  }
+  // NOTA: candado desactivado temporalmente para pruebas. Reactivar luego.
   const anio = req.body?.anio || new Date().getFullYear();
   const hastaMes = req.body?.hastaMes || (new Date().getMonth() + 1);
   try {
