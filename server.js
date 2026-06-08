@@ -14,7 +14,6 @@ const {
   SUPABASE_URL,
   SUPABASE_SERVICE_KEY,   // usar la service_role key (escribe en la tabla)
   CLIENTE_NIT = "901422372", // Bentley por defecto
-  EXTRACTOR_SECRET,        // clave simple para proteger el endpoint
   PORT = 3000
 } = process.env;
 
