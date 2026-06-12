@@ -14,6 +14,7 @@ const {
   SUPABASE_URL,
   SUPABASE_SERVICE_KEY,   // usar la service_role key (escribe en la tabla)
   CLIENTE_NIT = "901422372", // Bentley por defecto
+  EXTRACTOR_SECRET,        // clave simple para proteger el endpoint
   PORT = 3000
 } = process.env;
 
@@ -109,6 +110,15 @@ async function extraer({ anio, hastaMes }) {
 // --- servidor con el endpoint que dispara el botón ---
 const app = express();
 app.use(express.json());
+
+// CORS: permite que el botón "Actualizar Effi" (Netlify) llame a este servicio
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, x-secret");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 
 app.get("/", (_req, res) => res.send("Extractor Effi activo"));
 
