@@ -42,16 +42,21 @@ function ultimoDiaMes(anio, mes) {
 async function leerResumen(page, tipo, anio, mes) {
   const dd = String(ultimoDiaMes(anio, mes)).padStart(2, "0");
   const mm = String(mes).padStart(2, "0");
-  let url;
+  let url, etiquetaCount;
   if (tipo === "venta") {
     url = `https://effi.com.co/app/factura_v?desde=${anio}-${mm}-01%2000:00:00&hasta=${anio}-${mm}-${dd}%2023:59:59`;
-  } else {
+    etiquetaCount = "facturas de venta encontradas";
+  } else if (tipo === "compra") {
     url = `https://effi.com.co/app/factura_c?compra_desde=${anio}-${mm}-01&compra_hasta=${anio}-${mm}-${dd}`;
+    etiquetaCount = "facturas de compra encontradas";
+  } else if (tipo === "nc_venta") {
+    // Notas crédito de venta: restan ventas e IVA generado (mismo resumen y filtro desde/hasta)
+    url = `https://effi.com.co/app/nota_credito_v?desde=${anio}-${mm}-01%2000:00:00&hasta=${anio}-${mm}-${dd}%2023:59:59`;
+    etiquetaCount = "notas crédito de venta encontradas";
   }
   await page.goto(url, { waitUntil: "networkidle", timeout: 60000 });
   await page.waitForTimeout(2500);
   const t = await page.evaluate(() => document.body.innerText);
-  const etiquetaCount = tipo === "venta" ? "facturas de venta encontradas" : "facturas de compra encontradas";
   const fm = t.match(new RegExp("(\\d+)\\s+" + etiquetaCount));
   return {
     cliente_nit: CLIENTE_NIT,
@@ -88,9 +93,9 @@ async function extraer({ anio, hastaMes }) {
     // Esperar a que cargue el panel (sale de /ingreso)
     await page.waitForTimeout(6000);
 
-    // 2) Recorrer cada mes (ventas y compras)
+    // 2) Recorrer cada mes (ventas, compras y notas crédito de venta)
     for (let mes = 1; mes <= hastaMes; mes++) {
-      for (const tipo of ["venta", "compra"]) {
+      for (const tipo of ["venta", "compra", "nc_venta"]) {
         const fila = await leerResumen(page, tipo, anio, mes);
         filas.push(fila);
       }
