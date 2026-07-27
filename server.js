@@ -38,6 +38,16 @@ function ultimoDiaMes(anio, mes) {
   return new Date(anio, mes, 0).getDate(); // mes 1..12
 }
 
+// new Date(str).toISOString() TIRA (RangeError) si str no es parseable —
+// y como se llama dentro de un .map() sobre miles de filas, una sola fecha
+// rara (formato distinto, celda compuesta, vacía) tumbaba el lote completo.
+// Esta versión nunca lanza: null si no se pudo parsear.
+function parsearFechaSegura(texto) {
+  if (!texto) return null;
+  const d = new Date(texto);
+  return isNaN(d.getTime()) ? null : d.toISOString();
+}
+
 // ============================================================
 // TRAZABILIDAD DE DINERO (Tesorería) — requisitos de negocio, ver
 // docs/effi-trazabilidad-dinero.sql en tribulars-app:
@@ -196,10 +206,15 @@ async function extraerTrazabilidadDinero(page) {
 
   return filasTodas
     .filter((f) => f.effi_id) // sin ID no hay forma de deduplicar de forma segura
+    .filter((f) => {
+      const ok = parsearFechaSegura(f.fechaTexto) != null;
+      if (!ok) console.warn(`[traz] fila descartada (fecha no parseable): id=${f.effi_id} fecha="${f.fechaTexto}"`);
+      return ok;
+    })
     .map((f) => ({
       cliente_nit: CLIENTE_NIT,
       effi_id: f.effi_id,
-      fecha: f.fechaTexto ? new Date(f.fechaTexto).toISOString() : null,
+      fecha: parsearFechaSegura(f.fechaTexto),
       sucursal_transaccion: f.sucursal_transaccion,
       transaccion: f.transaccion,
       detalles: f.detalles,
@@ -210,8 +225,7 @@ async function extraerTrazabilidadDinero(page) {
       observacion: f.observacion,
       responsable: f.responsable,
       fecha_sync: new Date().toISOString()
-    }))
-    .filter((f) => f.fecha); // descarta filas cuya fecha no se pudo parsear
+    }));
 }
 
 // --- extrae un módulo (venta/compra) de un mes ---
