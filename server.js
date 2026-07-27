@@ -340,10 +340,26 @@ async function extraer({ anio, hastaMes }) {
     if (filasTrazUnicas.length !== filasTraz.length) {
       console.warn(`[traz] deduplicadas ${filasTraz.length - filasTrazUnicas.length} filas repetidas por effi_id antes de guardar`);
     }
-    const { error: errorTraz } = await sb
-      .from("effi_trazabilidad_dinero")
-      .upsert(filasTrazUnicas, { onConflict: "cliente_nit,effi_id" });
-    if (errorTraz) console.error("[traz] error guardando en Supabase:", errorTraz);
+    // Mandar ~2600 filas en un solo upsert parece tumbar el proceso (log
+    // termina en seco, sin error de JS ni de Postgres — huele a OOM del
+    // contenedor armando/serializando un payload grande de una sola vez).
+    // Se parte en lotes chicos: baja el pico de memoria y, si un lote
+    // falla, los demás igual se guardan.
+    const TAMANO_LOTE = 300;
+    let guardadas = 0, lotesConError = 0;
+    for (let i = 0; i < filasTrazUnicas.length; i += TAMANO_LOTE) {
+      const lote = filasTrazUnicas.slice(i, i + TAMANO_LOTE);
+      const { error: errorTraz } = await sb
+        .from("effi_trazabilidad_dinero")
+        .upsert(lote, { onConflict: "cliente_nit,effi_id" });
+      if (errorTraz) {
+        lotesConError++;
+        console.error(`[traz] error guardando lote ${i}-${i + lote.length}:`, errorTraz);
+      } else {
+        guardadas += lote.length;
+      }
+    }
+    console.log(`[traz] guardado: ${guardadas}/${filasTrazUnicas.length} filas` + (lotesConError ? ` (${lotesConError} lote(s) con error)` : ""));
   }
 
   return { filas, filasTraz };
