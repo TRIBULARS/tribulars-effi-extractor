@@ -329,9 +329,20 @@ async function extraer({ anio, hastaMes }) {
   if (error) throw error;
 
   if (filasTraz.length) {
+    // Postgres no permite que un mismo upsert en lote toque la misma fila
+    // dos veces ("ON CONFLICT DO UPDATE cannot affect row a second time").
+    // Puede pasar si un mismo effi_id aparece repetido (ej. paginación que
+    // re-lee una página, o un movimiento visible bajo más de un filtro).
+    // Se dedupea por effi_id quedándose con la última ocurrencia.
+    const porId = new Map();
+    filasTraz.forEach((f) => porId.set(f.effi_id, f));
+    const filasTrazUnicas = Array.from(porId.values());
+    if (filasTrazUnicas.length !== filasTraz.length) {
+      console.warn(`[traz] deduplicadas ${filasTraz.length - filasTrazUnicas.length} filas repetidas por effi_id antes de guardar`);
+    }
     const { error: errorTraz } = await sb
       .from("effi_trazabilidad_dinero")
-      .upsert(filasTraz, { onConflict: "cliente_nit,effi_id" });
+      .upsert(filasTrazUnicas, { onConflict: "cliente_nit,effi_id" });
     if (errorTraz) console.error("[traz] error guardando en Supabase:", errorTraz);
   }
 
