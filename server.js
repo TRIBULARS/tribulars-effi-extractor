@@ -44,8 +44,18 @@ function ultimoDiaMes(anio, mes) {
 // Esta versión nunca lanza: null si no se pudo parsear.
 function parsearFechaSegura(texto) {
   if (!texto) return null;
-  const d = new Date(texto);
-  return isNaN(d.getTime()) ? null : d.toISOString();
+  // Formato compuesto confirmado en logs: "Real: 2026-06-19  Creación:
+  // 2026-06-24 12:16:30" — aparece cuando la fecha real del movimiento
+  // difiere de cuándo se registró en Effi. Se usa la fecha REAL (la del
+  // movimiento en sí), no la de creación del registro.
+  const real = texto.match(/Real:\s*([\d/-]+)/i);
+  if (real) {
+    const d = new Date(real[1]);
+    if (!isNaN(d.getTime())) return d.toISOString();
+  }
+  // Formato simple (fecha/hora directa, sin "Real:"/"Creación:").
+  const d2 = new Date(texto);
+  return isNaN(d2.getTime()) ? null : d2.toISOString();
 }
 
 // ============================================================
@@ -204,13 +214,23 @@ async function extraerTrazabilidadDinero(page) {
     filasTodas.push(...filas.map((f) => ({ ...f, medio_pago: guardar })));
   }
 
-  return filasTodas
+  // Logging acotado: con miles de filas, un warn por fila puede pisar el
+  // límite de logs/seg de Railway (ya pasó). Solo se detallan las primeras
+  // 20; el resto se resume en un solo conteo al final.
+  let fechasNoParseadas = 0;
+  const filtradas = filasTodas
     .filter((f) => f.effi_id) // sin ID no hay forma de deduplicar de forma segura
     .filter((f) => {
       const ok = parsearFechaSegura(f.fechaTexto) != null;
-      if (!ok) console.warn(`[traz] fila descartada (fecha no parseable): id=${f.effi_id} fecha="${f.fechaTexto}"`);
+      if (!ok) {
+        fechasNoParseadas++;
+        if (fechasNoParseadas <= 20) console.warn(`[traz] fila descartada (fecha no parseable): id=${f.effi_id} fecha="${f.fechaTexto}"`);
+      }
       return ok;
-    })
+    });
+  if (fechasNoParseadas > 20) console.warn(`[traz] ... y ${fechasNoParseadas - 20} filas más descartadas por fecha no parseable (total: ${fechasNoParseadas})`);
+
+  return filtradas
     .map((f) => ({
       cliente_nit: CLIENTE_NIT,
       effi_id: f.effi_id,
