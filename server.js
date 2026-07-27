@@ -64,40 +64,33 @@ const TRAZ_MEDIOS_PERMITIDOS = [
 ];
 const TRAZ_VIGENCIA_VALOR = "Transacción vigente"; // confirmado por captura 2026-07-27
 
-// Busca un <select> nativo o un widget custom (select2-like) cerca de un
-// texto de etiqueta visible, y selecciona la PRIMERA opción cuyo texto
-// contenga subTexto (no requiere coincidencia exacta).
-async function seleccionarPorEtiquetaParcial(page, etiqueta, subTexto) {
-  const label = page.locator("text=" + etiqueta).first();
-
-  // Intento 1: <select> nativo (a veces select2 deja uno funcional debajo).
-  const select = label.locator("xpath=following::select[1]");
-  if (await select.count()) {
-    try {
-      const valor = await select.evaluate((el, sub) => {
-        const opt = Array.from(el.options).find((o) => o.textContent.includes(sub));
-        return opt ? opt.value : null;
-      }, subTexto);
-      if (valor != null) {
-        await select.selectOption({ value: valor });
-        return true;
-      }
-    } catch (e) {
-      console.warn(`[traz] <select> nativo falló para "${etiqueta}" ~ "${subTexto}": ${e.message}`);
-    }
+// Confirmado en logs de Railway (2026-07-27): Effi usa el plugin Chosen.js
+// — el <select> real existe con ID fijo pero queda oculto (display:none) y
+// Chosen dibuja un widget encima. selectOption normal falla por "element is
+// not visible". Fix: ir directo por ID + { force: true } para saltarse el
+// chequeo de visibilidad (Playwright igual dispara change/input, que es lo
+// que Chosen escucha para sincronizar su UI — y lo que el form realmente
+// envía en "Aplicar filtros").
+async function seleccionarChosen(page, selectId, subTexto) {
+  const select = page.locator("#" + selectId);
+  if (!(await select.count())) {
+    console.warn(`[traz] no encontré #${selectId} en la página`);
+    return false;
   }
-
-  // Intento 2: widget custom — click para abrir, click en la opción que
-  // contenga el substring (regex escapada, case-insensitive).
   try {
-    const widget = label.locator("xpath=following::*[contains(@class,'select') or contains(@class,'dropdown') or contains(@class,'chosen')][1]").first();
-    await widget.click({ timeout: 3000 });
-    const escapado = subTexto.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const opcion = page.locator("text=/" + escapado + "/i").first();
-    await opcion.click({ timeout: 3000 });
+    const valor = await select.evaluate((el, sub) => {
+      const opt = Array.from(el.options).find((o) => o.textContent.includes(sub));
+      return opt ? opt.value : null;
+    }, subTexto);
+    if (valor == null) {
+      const opciones = await select.evaluate((el) => Array.from(el.options).map((o) => o.textContent.trim()));
+      console.warn(`[traz] ninguna <option> de #${selectId} contiene "${subTexto}". Opciones disponibles: ${JSON.stringify(opciones)}`);
+      return false;
+    }
+    await select.selectOption({ value: valor }, { force: true });
     return true;
   } catch (e) {
-    console.warn(`[traz] fallback custom-dropdown también falló para "${etiqueta}" ~ "${subTexto}": ${e.message}`);
+    console.warn(`[traz] selectOption forzado falló en #${selectId} ~ "${subTexto}": ${e.message}`);
     return false;
   }
 }
@@ -166,7 +159,7 @@ async function leerTablaTrazabilidad(page) {
 // todo lo que Effi quiera mostrar y el histórico se va acumulando en
 // Supabase corrida tras corrida (upsert, nunca se pierde lo ya guardado).
 async function extraerTrazabilidadDinero(page) {
-  const TRAZ_URL = "https://effi.com.co/app/trazabilidad_dinero"; // TODO: confirmar ruta real (se infiere del nombre del menú)
+  const TRAZ_URL = "https://effi.com.co/app/trazabilidad_dinero"; // confirmado por logs 2026-07-27 (encontró #medio_pago y #vigencia_trans en esta ruta)
   const filasTodas = [];
 
   for (const { buscar, guardar } of TRAZ_MEDIOS_PERMITIDOS) {
@@ -175,8 +168,8 @@ async function extraerTrazabilidadDinero(page) {
     });
     await page.waitForTimeout(1500);
 
-    const okVigencia = await seleccionarPorEtiquetaParcial(page, "Vigencia de transacción", TRAZ_VIGENCIA_VALOR);
-    const okMedio = await seleccionarPorEtiquetaParcial(page, "Medio de pago", buscar);
+    const okVigencia = await seleccionarChosen(page, "vigencia_trans", TRAZ_VIGENCIA_VALOR);
+    const okMedio = await seleccionarChosen(page, "medio_pago", buscar);
     if (!okVigencia || !okMedio) {
       console.warn(`[traz] filtros incompletos para medio~"${buscar}" (vigencia=${okVigencia}, medio=${okMedio}) — se omite esta pasada`);
       continue;
