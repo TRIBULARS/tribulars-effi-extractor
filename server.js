@@ -38,6 +38,156 @@ function ultimoDiaMes(anio, mes) {
   return new Date(anio, mes, 0).getDate(); // mes 1..12
 }
 
+// ============================================================
+// TRAZABILIDAD DE DINERO (Tesorería) — requisitos de negocio, ver
+// docs/effi-trazabilidad-dinero.sql en tribulars-app:
+//  1. Dispara desde el mismo /extraer (ya lo hace, ver extraer() abajo).
+//  2 y 4. Solo transacciones VIGENTES (nunca anuladas).
+//  3. Solo estos medios de pago.
+//
+// ⚠️ TRAZ_MEDIOS_PERMITIDOS y TRAZ_VIGENCIA_VALOR son un PRIMER INTENTO —
+// el texto EXACTO de las opciones del combo "Medio de pago*" y
+// "Vigencia de transacción" en Effi todavía no está confirmado (falta
+// captura de pantalla de esos dos desplegables). Si al correr esto en
+// Railway el log dice "opción no encontrada", hay que ajustar estas listas
+// con el texto real y redeployar. NO asumir que esto funciona sin probarlo.
+// ============================================================
+const TRAZ_MEDIOS_PERMITIDOS = ["BANCOLOMBIA", "ADDI", "SISTECREDITO", "WOMPI", "DAVIVIENDA", "BOLD"]; // TODO: confirmar texto exacto
+const TRAZ_VIGENCIA_VALOR = "Vigente"; // TODO: confirmar texto exacto
+
+// Busca un <select> nativo cerca de un texto de etiqueta visible y le
+// selecciona una opción por texto. Si Effi usa un widget custom (no un
+// <select> nativo) esto va a fallar — hay variante custom más abajo.
+async function seleccionarPorEtiqueta(page, etiqueta, opcionTexto) {
+  const label = page.locator("text=" + etiqueta).first();
+  const select = label.locator("xpath=following::select[1]");
+  if (await select.count()) {
+    try {
+      await select.selectOption({ label: opcionTexto });
+      return true;
+    } catch (e) {
+      console.warn(`[traz] no pude seleccionar "${opcionTexto}" en <select> cerca de "${etiqueta}": ${e.message}`);
+    }
+  }
+  // Fallback: dropdown custom tipo select2/choices.js — click para abrir,
+  // click en la opción por texto visible.
+  try {
+    const widget = label.locator("xpath=following::*[contains(@class,'select') or contains(@class,'dropdown')][1]").first();
+    await widget.click({ timeout: 3000 });
+    await page.locator("text=" + opcionTexto).first().click({ timeout: 3000 });
+    return true;
+  } catch (e) {
+    console.warn(`[traz] fallback custom-dropdown también falló para "${etiqueta}" = "${opcionTexto}": ${e.message}`);
+    return false;
+  }
+}
+
+async function aplicarFiltros(page) {
+  const btn = page.locator("button, a").filter({ hasText: /aplicar filtros/i }).first();
+  await btn.click({ timeout: 10000 });
+  await page.waitForTimeout(2000);
+}
+
+// Lee la tabla de resultados de Trazabilidad de dinero para el medio de
+// pago ya filtrado. Lee encabezados dinámicamente (no asume orden fijo de
+// columnas) por si Effi agrega/quita una columna.
+async function leerTablaTrazabilidad(page) {
+  const headers = await page.locator("table thead th").allTextContents();
+  const norm = (s) => s.trim().toLowerCase();
+  const idx = {
+    fecha: headers.findIndex((h) => norm(h).includes("fecha")),
+    id: headers.findIndex((h) => norm(h) === "id"),
+    sucursal: headers.findIndex((h) => norm(h).includes("sucursal")),
+    transaccion: headers.findIndex((h) => norm(h) === "transacción" || norm(h) === "transaccion"),
+    detalles: headers.findIndex((h) => norm(h).includes("detalle")),
+    efectivo: headers.findIndex((h) => norm(h).includes("efectivo")),
+    banco: headers.findIndex((h) => norm(h).includes("banco")),
+    observacion: headers.findIndex((h) => norm(h).includes("observaci")),
+    responsable: headers.findIndex((h) => norm(h).includes("responsable"))
+  };
+
+  const filas = [];
+  let pagina = 1;
+  const TOPE_PAGINAS = 50; // salvaguarda anti-loop-infinito
+  while (pagina <= TOPE_PAGINAS) {
+    const rows = page.locator("table tbody tr");
+    const n = await rows.count();
+    for (let i = 0; i < n; i++) {
+      const tds = await rows.nth(i).locator("td").allTextContents();
+      if (!tds.length) continue;
+      const get = (k) => (idx[k] >= 0 && tds[idx[k]] != null ? tds[idx[k]].trim() : "");
+      filas.push({
+        effi_id: get("id"),
+        fechaTexto: get("fecha"),
+        sucursal_transaccion: get("sucursal"),
+        transaccion: get("transaccion"),
+        detalles: get("detalles"),
+        efectivo: num(get("efectivo")),
+        banco: num(get("banco")),
+        observacion: get("observacion"),
+        responsable: get("responsable")
+      });
+    }
+    // Paginación: buscar botón "Siguiente" / ">" habilitado.
+    const siguiente = page.locator("a, button").filter({ hasText: /siguiente|›|»/i }).first();
+    if (!(await siguiente.count())) break;
+    const disabled = await siguiente.evaluate((el) => el.classList.contains("disabled") || el.getAttribute("aria-disabled") === "true").catch(() => false);
+    if (disabled) break;
+    await siguiente.click({ timeout: 5000 }).catch(() => { pagina = TOPE_PAGINAS + 1; });
+    await page.waitForTimeout(1200);
+    pagina++;
+  }
+  return filas;
+}
+
+// Trae Trazabilidad de dinero completa (todos los medios permitidos,
+// solo vigentes). No filtra por mes: Effi solo retiene una ventana
+// reciente ("Solo se visualizan los registros desde..."), así que se pide
+// todo lo que Effi quiera mostrar y el histórico se va acumulando en
+// Supabase corrida tras corrida (upsert, nunca se pierde lo ya guardado).
+async function extraerTrazabilidadDinero(page) {
+  const TRAZ_URL = "https://effi.com.co/app/trazabilidad_dinero"; // TODO: confirmar ruta real (se infiere del nombre del menú)
+  const filasTodas = [];
+
+  for (const medio of TRAZ_MEDIOS_PERMITIDOS) {
+    await page.goto(TRAZ_URL, { waitUntil: "networkidle", timeout: 60000 }).catch((e) => {
+      console.warn(`[traz] no pude navegar a ${TRAZ_URL}: ${e.message}`);
+    });
+    await page.waitForTimeout(1500);
+
+    const okVigencia = await seleccionarPorEtiqueta(page, "Vigencia de transacción", TRAZ_VIGENCIA_VALOR);
+    const okMedio = await seleccionarPorEtiqueta(page, "Medio de pago", medio);
+    if (!okVigencia || !okMedio) {
+      console.warn(`[traz] filtros incompletos para medio="${medio}" (vigencia=${okVigencia}, medio=${okMedio}) — se omite esta pasada`);
+      continue;
+    }
+
+    await aplicarFiltros(page);
+    const filas = await leerTablaTrazabilidad(page);
+    console.log(`[traz] medio=${medio}: ${filas.length} movimientos`);
+    filasTodas.push(...filas.map((f) => ({ ...f, medio_pago: medio })));
+  }
+
+  return filasTodas
+    .filter((f) => f.effi_id) // sin ID no hay forma de deduplicar de forma segura
+    .map((f) => ({
+      cliente_nit: CLIENTE_NIT,
+      effi_id: f.effi_id,
+      fecha: f.fechaTexto ? new Date(f.fechaTexto).toISOString() : null,
+      sucursal_transaccion: f.sucursal_transaccion,
+      transaccion: f.transaccion,
+      detalles: f.detalles,
+      medio_pago: f.medio_pago,
+      vigencia: "vigente", // por diseño: solo se filtró y trajo lo vigente
+      efectivo: f.efectivo,
+      banco: f.banco,
+      observacion: f.observacion,
+      responsable: f.responsable,
+      fecha_sync: new Date().toISOString()
+    }))
+    .filter((f) => f.fecha); // descarta filas cuya fecha no se pudo parsear
+}
+
 // --- extrae un módulo (venta/compra) de un mes ---
 async function leerResumen(page, tipo, anio, mes) {
   const dd = String(ultimoDiaMes(anio, mes)).padStart(2, "0");
@@ -100,6 +250,14 @@ async function extraer({ anio, hastaMes }) {
         filas.push(fila);
       }
     }
+
+    // 2b) Trazabilidad de dinero (Tesorería) — misma sesión, mismo botón.
+    var filasTraz = [];
+    try {
+      filasTraz = await extraerTrazabilidadDinero(page);
+    } catch (e) {
+      console.error("[traz] error extrayendo trazabilidad de dinero (no interrumpe el resto):", e);
+    }
   } finally {
     await browser.close();
   }
@@ -109,7 +267,15 @@ async function extraer({ anio, hastaMes }) {
     .from("effi_resumen")
     .upsert(filas, { onConflict: "cliente_nit,anio,mes,tipo" });
   if (error) throw error;
-  return filas;
+
+  if (filasTraz.length) {
+    const { error: errorTraz } = await sb
+      .from("effi_trazabilidad_dinero")
+      .upsert(filasTraz, { onConflict: "cliente_nit,effi_id" });
+    if (errorTraz) console.error("[traz] error guardando en Supabase:", errorTraz);
+  }
+
+  return { filas, filasTraz };
 }
 
 // --- servidor con el endpoint que dispara el botón ---
@@ -132,8 +298,8 @@ app.post("/extraer", async (req, res) => {
   const anio = req.body?.anio || new Date().getFullYear();
   const hastaMes = req.body?.hastaMes || (new Date().getMonth() + 1);
   try {
-    const filas = await extraer({ anio, hastaMes });
-    res.json({ ok: true, registros: filas.length, filas });
+    const { filas, filasTraz } = await extraer({ anio, hastaMes });
+    res.json({ ok: true, registros: filas.length, filas, registrosTraz: filasTraz.length, filasTraz });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: String(e.message || e) });
