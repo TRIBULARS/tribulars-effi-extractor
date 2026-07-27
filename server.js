@@ -45,39 +45,59 @@ function ultimoDiaMes(anio, mes) {
 //  2 y 4. Solo transacciones VIGENTES (nunca anuladas).
 //  3. Solo estos medios de pago.
 //
-// ⚠️ TRAZ_MEDIOS_PERMITIDOS y TRAZ_VIGENCIA_VALOR son un PRIMER INTENTO —
-// el texto EXACTO de las opciones del combo "Medio de pago*" y
-// "Vigencia de transacción" en Effi todavía no está confirmado (falta
-// captura de pantalla de esos dos desplegables). Si al correr esto en
-// Railway el log dice "opción no encontrada", hay que ajustar estas listas
-// con el texto real y redeployar. NO asumir que esto funciona sin probarlo.
+// Confirmado por captura 2026-07-27 — el combo "Medio de pago*" tiene UNA
+// sola opción "Transferencia bancaria(BANCOL, ADDI, SIST, WOMP, DAVIVIENDA)"
+// (no son 5 opciones separadas, era un error de interpretación inicial) más
+// otra para "Bold" (aún no confirmado el texto exacto, se busca por
+// substring "Bold"). Por eso el matching es por TEXTO PARCIAL, no exacto:
+// así no importa el número de prefijo ("5 - ...") ni que Effi reordene la
+// lista. "Vigencia de transacción" SÍ tiene texto confirmado y exacto:
+// "Transacción vigente" / "Transacción anulada".
+//
+// ⚠️ Sigue siendo el widget de Effi sin probar en vivo: es un dropdown tipo
+// select2 (con buscador). Si el log de Railway dice "no pude seleccionar",
+// hay que ajustar esta lógica viendo el DOM real.
 // ============================================================
-const TRAZ_MEDIOS_PERMITIDOS = ["BANCOLOMBIA", "ADDI", "SISTECREDITO", "WOMPI", "DAVIVIENDA", "BOLD"]; // TODO: confirmar texto exacto
-const TRAZ_VIGENCIA_VALOR = "Vigente"; // TODO: confirmar texto exacto
+const TRAZ_MEDIOS_PERMITIDOS = [
+  { buscar: "Transferencia bancaria", guardar: "TRANSFERENCIA_BANCARIA" },
+  { buscar: "Bold", guardar: "BOLD" } // TODO: confirmar texto exacto de esta opción (falta scroll en la captura)
+];
+const TRAZ_VIGENCIA_VALOR = "Transacción vigente"; // confirmado por captura 2026-07-27
 
-// Busca un <select> nativo cerca de un texto de etiqueta visible y le
-// selecciona una opción por texto. Si Effi usa un widget custom (no un
-// <select> nativo) esto va a fallar — hay variante custom más abajo.
-async function seleccionarPorEtiqueta(page, etiqueta, opcionTexto) {
+// Busca un <select> nativo o un widget custom (select2-like) cerca de un
+// texto de etiqueta visible, y selecciona la PRIMERA opción cuyo texto
+// contenga subTexto (no requiere coincidencia exacta).
+async function seleccionarPorEtiquetaParcial(page, etiqueta, subTexto) {
   const label = page.locator("text=" + etiqueta).first();
+
+  // Intento 1: <select> nativo (a veces select2 deja uno funcional debajo).
   const select = label.locator("xpath=following::select[1]");
   if (await select.count()) {
     try {
-      await select.selectOption({ label: opcionTexto });
-      return true;
+      const valor = await select.evaluate((el, sub) => {
+        const opt = Array.from(el.options).find((o) => o.textContent.includes(sub));
+        return opt ? opt.value : null;
+      }, subTexto);
+      if (valor != null) {
+        await select.selectOption({ value: valor });
+        return true;
+      }
     } catch (e) {
-      console.warn(`[traz] no pude seleccionar "${opcionTexto}" en <select> cerca de "${etiqueta}": ${e.message}`);
+      console.warn(`[traz] <select> nativo falló para "${etiqueta}" ~ "${subTexto}": ${e.message}`);
     }
   }
-  // Fallback: dropdown custom tipo select2/choices.js — click para abrir,
-  // click en la opción por texto visible.
+
+  // Intento 2: widget custom — click para abrir, click en la opción que
+  // contenga el substring (regex escapada, case-insensitive).
   try {
-    const widget = label.locator("xpath=following::*[contains(@class,'select') or contains(@class,'dropdown')][1]").first();
+    const widget = label.locator("xpath=following::*[contains(@class,'select') or contains(@class,'dropdown') or contains(@class,'chosen')][1]").first();
     await widget.click({ timeout: 3000 });
-    await page.locator("text=" + opcionTexto).first().click({ timeout: 3000 });
+    const escapado = subTexto.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const opcion = page.locator("text=/" + escapado + "/i").first();
+    await opcion.click({ timeout: 3000 });
     return true;
   } catch (e) {
-    console.warn(`[traz] fallback custom-dropdown también falló para "${etiqueta}" = "${opcionTexto}": ${e.message}`);
+    console.warn(`[traz] fallback custom-dropdown también falló para "${etiqueta}" ~ "${subTexto}": ${e.message}`);
     return false;
   }
 }
@@ -149,23 +169,23 @@ async function extraerTrazabilidadDinero(page) {
   const TRAZ_URL = "https://effi.com.co/app/trazabilidad_dinero"; // TODO: confirmar ruta real (se infiere del nombre del menú)
   const filasTodas = [];
 
-  for (const medio of TRAZ_MEDIOS_PERMITIDOS) {
+  for (const { buscar, guardar } of TRAZ_MEDIOS_PERMITIDOS) {
     await page.goto(TRAZ_URL, { waitUntil: "networkidle", timeout: 60000 }).catch((e) => {
       console.warn(`[traz] no pude navegar a ${TRAZ_URL}: ${e.message}`);
     });
     await page.waitForTimeout(1500);
 
-    const okVigencia = await seleccionarPorEtiqueta(page, "Vigencia de transacción", TRAZ_VIGENCIA_VALOR);
-    const okMedio = await seleccionarPorEtiqueta(page, "Medio de pago", medio);
+    const okVigencia = await seleccionarPorEtiquetaParcial(page, "Vigencia de transacción", TRAZ_VIGENCIA_VALOR);
+    const okMedio = await seleccionarPorEtiquetaParcial(page, "Medio de pago", buscar);
     if (!okVigencia || !okMedio) {
-      console.warn(`[traz] filtros incompletos para medio="${medio}" (vigencia=${okVigencia}, medio=${okMedio}) — se omite esta pasada`);
+      console.warn(`[traz] filtros incompletos para medio~"${buscar}" (vigencia=${okVigencia}, medio=${okMedio}) — se omite esta pasada`);
       continue;
     }
 
     await aplicarFiltros(page);
     const filas = await leerTablaTrazabilidad(page);
-    console.log(`[traz] medio=${medio}: ${filas.length} movimientos`);
-    filasTodas.push(...filas.map((f) => ({ ...f, medio_pago: medio })));
+    console.log(`[traz] medio=${guardar}: ${filas.length} movimientos`);
+    filasTodas.push(...filas.map((f) => ({ ...f, medio_pago: guardar })));
   }
 
   return filasTodas
