@@ -180,20 +180,90 @@ async function leerTablaTrazabilidad(page) {
     const disabled = await siguiente.evaluate((el) => el.classList.contains("disabled") || el.getAttribute("aria-disabled") === "true").catch(() => false);
     if (disabled) break;
     await siguiente.click({ timeout: 5000 }).catch(() => { pagina = TOPE_PAGINAS + 1; });
-    await page.waitForTimeout(1200);
+    // Recortado de 1200ms: con ~100+ páginas por medio de pago, cada ms
+    // acá se multiplica y suma minutos a la petición completa.
+    await page.waitForTimeout(600);
     pagina++;
   }
   return filas;
 }
 
-// Trae Trazabilidad de dinero completa (todos los medios permitidos,
-// solo vigentes). No filtra por mes: Effi solo retiene una ventana
+// Prepara filas crudas de una pasada (un medio de pago) al formato final
+// de effi_trazabilidad_dinero, descartando las que no tengan effi_id o
+// fecha parseable. Logging acotado: con miles de filas, un warn por fila
+// puede pisar el límite de logs/seg de Railway (ya pasó una vez).
+function prepararFilasTraz(filasCrudas, medioGuardar) {
+  let fechasNoParseadas = 0;
+  const listas = filasCrudas
+    .filter((f) => f.effi_id) // sin ID no hay forma de deduplicar de forma segura
+    .filter((f) => {
+      const ok = parsearFechaSegura(f.fechaTexto) != null;
+      if (!ok) {
+        fechasNoParseadas++;
+        if (fechasNoParseadas <= 10) console.warn(`[traz] fila descartada (fecha no parseable): id=${f.effi_id} fecha="${f.fechaTexto}"`);
+      }
+      return ok;
+    })
+    .map((f) => ({
+      cliente_nit: CLIENTE_NIT,
+      effi_id: f.effi_id,
+      fecha: parsearFechaSegura(f.fechaTexto),
+      sucursal_transaccion: f.sucursal_transaccion,
+      transaccion: f.transaccion,
+      detalles: f.detalles,
+      medio_pago: medioGuardar,
+      vigencia: "vigente", // por diseño: solo se filtró y trajo lo vigente
+      efectivo: f.efectivo,
+      banco: f.banco,
+      observacion: f.observacion,
+      responsable: f.responsable,
+      fecha_sync: new Date().toISOString()
+    }));
+  if (fechasNoParseadas > 10) console.warn(`[traz] ... y ${fechasNoParseadas - 10} filas más descartadas por fecha no parseable (total: ${fechasNoParseadas})`);
+  return listas;
+}
+
+// Guarda un lote de filas de trazabilidad en Supabase, partido en trozos
+// chicos (baja el pico de memoria/payload; si un trozo falla, los demás
+// igual se guardan). Dedupea por effi_id primero (Postgres no permite que
+// un mismo upsert toque la misma fila dos veces).
+async function guardarTrazEnLotes(filas, etiqueta) {
+  if (!filas.length) return;
+  const porId = new Map();
+  filas.forEach((f) => porId.set(f.effi_id, f));
+  const unicas = Array.from(porId.values());
+  if (unicas.length !== filas.length) {
+    console.warn(`[traz] ${etiqueta}: deduplicadas ${filas.length - unicas.length} filas repetidas por effi_id`);
+  }
+  const TAMANO_LOTE = 300;
+  let guardadas = 0, lotesConError = 0;
+  for (let i = 0; i < unicas.length; i += TAMANO_LOTE) {
+    const lote = unicas.slice(i, i + TAMANO_LOTE);
+    const { error } = await sb.from("effi_trazabilidad_dinero").upsert(lote, { onConflict: "cliente_nit,effi_id" });
+    if (error) {
+      lotesConError++;
+      console.error(`[traz] ${etiqueta}: error guardando lote ${i}-${i + lote.length}:`, error);
+    } else {
+      guardadas += lote.length;
+    }
+  }
+  console.log(`[traz] ${etiqueta}: guardado ${guardadas}/${unicas.length} filas` + (lotesConError ? ` (${lotesConError} lote(s) con error)` : ""));
+}
+
+// Trae Trazabilidad de dinero completa (todos los medios permitidos, solo
+// vigentes) y GUARDA cada medio apenas termina de scrapearlo (no espera a
+// tenerlo todo junto). No filtra por mes: Effi solo retiene una ventana
 // reciente ("Solo se visualizan los registros desde..."), así que se pide
 // todo lo que Effi quiera mostrar y el histórico se va acumulando en
-// Supabase corrida tras corrida (upsert, nunca se pierde lo ya guardado).
+// Supabase corrida tras corrida.
+//
+// Guardar por medio (no todo al final) es a propósito: si esta petición se
+// corta a mitad de camino (timeout de plataforma, lo que parece estar
+// pasando con lotes grandes en una sola petición), lo ya scrapeado no se
+// pierde — queda guardado antes de intentar el siguiente medio.
 async function extraerTrazabilidadDinero(page) {
   const TRAZ_URL = "https://effi.com.co/app/trazabilidad_dinero"; // confirmado por logs 2026-07-27 (encontró #medio_pago y #vigencia_trans en esta ruta)
-  const filasTodas = [];
+  let totalEncontradas = 0;
 
   for (const { buscar, guardar } of TRAZ_MEDIOS_PERMITIDOS) {
     await page.goto(TRAZ_URL, { waitUntil: "networkidle", timeout: 60000 }).catch((e) => {
@@ -209,43 +279,15 @@ async function extraerTrazabilidadDinero(page) {
     }
 
     await aplicarFiltros(page);
-    const filas = await leerTablaTrazabilidad(page);
-    console.log(`[traz] medio=${guardar}: ${filas.length} movimientos`);
-    filasTodas.push(...filas.map((f) => ({ ...f, medio_pago: guardar })));
+    const filasCrudas = await leerTablaTrazabilidad(page);
+    console.log(`[traz] medio=${guardar}: ${filasCrudas.length} movimientos scrapeados`);
+
+    const filasListas = prepararFilasTraz(filasCrudas, guardar);
+    await guardarTrazEnLotes(filasListas, guardar);
+    totalEncontradas += filasListas.length;
   }
 
-  // Logging acotado: con miles de filas, un warn por fila puede pisar el
-  // límite de logs/seg de Railway (ya pasó). Solo se detallan las primeras
-  // 20; el resto se resume en un solo conteo al final.
-  let fechasNoParseadas = 0;
-  const filtradas = filasTodas
-    .filter((f) => f.effi_id) // sin ID no hay forma de deduplicar de forma segura
-    .filter((f) => {
-      const ok = parsearFechaSegura(f.fechaTexto) != null;
-      if (!ok) {
-        fechasNoParseadas++;
-        if (fechasNoParseadas <= 20) console.warn(`[traz] fila descartada (fecha no parseable): id=${f.effi_id} fecha="${f.fechaTexto}"`);
-      }
-      return ok;
-    });
-  if (fechasNoParseadas > 20) console.warn(`[traz] ... y ${fechasNoParseadas - 20} filas más descartadas por fecha no parseable (total: ${fechasNoParseadas})`);
-
-  return filtradas
-    .map((f) => ({
-      cliente_nit: CLIENTE_NIT,
-      effi_id: f.effi_id,
-      fecha: parsearFechaSegura(f.fechaTexto),
-      sucursal_transaccion: f.sucursal_transaccion,
-      transaccion: f.transaccion,
-      detalles: f.detalles,
-      medio_pago: f.medio_pago,
-      vigencia: "vigente", // por diseño: solo se filtró y trajo lo vigente
-      efectivo: f.efectivo,
-      banco: f.banco,
-      observacion: f.observacion,
-      responsable: f.responsable,
-      fecha_sync: new Date().toISOString()
-    }));
+  return totalEncontradas;
 }
 
 // --- extrae un módulo (venta/compra) de un mes ---
@@ -281,88 +323,66 @@ async function leerResumen(page, tipo, anio, mes) {
   };
 }
 
-// --- proceso completo: login + recorrer meses + guardar ---
+// Login en Effi — compartido por extraer() y extraerYGuardarTrazabilidad().
+// NOTA: confirmar los selectores reales del formulario de ingreso de Effi.
+async function login(page) {
+  await page.goto(EFFI_URL, { waitUntil: "networkidle", timeout: 60000 });
+  await page.fill('input[type="email"], input[name="email"], #email', EFFI_EMAIL);
+  await page.fill('input[type="password"], input[name="password"], #password', EFFI_PASSWORD);
+  // Enviar el formulario: Enter suele bastar en casi cualquier login
+  await page.press('input[type="password"], input[name="password"], #password', "Enter");
+  await page.waitForTimeout(3000);
+  // Respaldo: si seguimos en la página de ingreso, buscar el botón por texto
+  if (page.url().includes("ingreso") || page.url().includes("login")) {
+    const btn = page.locator('button, input[type=submit], a.btn, a').filter({ hasText: /ingres|entrar|inicia|acceder/i }).first();
+    if (await btn.count()) { await btn.click({ timeout: 10000 }).catch(() => {}); }
+  }
+  // Esperar a que cargue el panel (sale de /ingreso)
+  await page.waitForTimeout(6000);
+}
+
+// --- proceso ventas/compras: login + recorrer meses + guardar ---
+// Trazabilidad de dinero corre SEPARADA (ver extraerYGuardarTrazabilidad):
+// hacerlo todo en una sola petición HTTP terminaba pasándose de varios
+// minutos y la plataforma mataba el contenedor a mitad de camino, sin
+// dejar ni un error en el log. Partirlo en dos peticiones más cortas evita
+// eso — el botón "Actualizar Effi" dispara ambas, sigue siendo un solo clic.
 async function extraer({ anio, hastaMes }) {
   const browser = await chromium.launch({ args: ["--no-sandbox"] });
   const page = await browser.newPage();
   const filas = [];
   try {
-    // 1) Login en Effi
-    // NOTA: confirmar los selectores reales del formulario de ingreso de Effi.
-    await page.goto(EFFI_URL, { waitUntil: "networkidle", timeout: 60000 });
-    await page.fill('input[type="email"], input[name="email"], #email', EFFI_EMAIL);
-    await page.fill('input[type="password"], input[name="password"], #password', EFFI_PASSWORD);
-    // Enviar el formulario: Enter suele bastar en casi cualquier login
-    await page.press('input[type="password"], input[name="password"], #password', "Enter");
-    await page.waitForTimeout(3000);
-    // Respaldo: si seguimos en la página de ingreso, buscar el botón por texto
-    if (page.url().includes("ingreso") || page.url().includes("login")) {
-      const btn = page.locator('button, input[type=submit], a.btn, a').filter({ hasText: /ingres|entrar|inicia|acceder/i }).first();
-      if (await btn.count()) { await btn.click({ timeout: 10000 }).catch(() => {}); }
-    }
-    // Esperar a que cargue el panel (sale de /ingreso)
-    await page.waitForTimeout(6000);
-
-    // 2) Recorrer cada mes (ventas, compras y notas crédito de venta)
+    await login(page);
     for (let mes = 1; mes <= hastaMes; mes++) {
       for (const tipo of ["venta", "compra", "nc_venta"]) {
         const fila = await leerResumen(page, tipo, anio, mes);
         filas.push(fila);
       }
     }
-
-    // 2b) Trazabilidad de dinero (Tesorería) — misma sesión, mismo botón.
-    var filasTraz = [];
-    try {
-      filasTraz = await extraerTrazabilidadDinero(page);
-    } catch (e) {
-      console.error("[traz] error extrayendo trazabilidad de dinero (no interrumpe el resto):", e);
-    }
   } finally {
     await browser.close();
   }
 
-  // 3) Guardar en Supabase (upsert: no duplica, actualiza)
   const { error } = await sb
     .from("effi_resumen")
     .upsert(filas, { onConflict: "cliente_nit,anio,mes,tipo" });
   if (error) throw error;
 
-  if (filasTraz.length) {
-    // Postgres no permite que un mismo upsert en lote toque la misma fila
-    // dos veces ("ON CONFLICT DO UPDATE cannot affect row a second time").
-    // Puede pasar si un mismo effi_id aparece repetido (ej. paginación que
-    // re-lee una página, o un movimiento visible bajo más de un filtro).
-    // Se dedupea por effi_id quedándose con la última ocurrencia.
-    const porId = new Map();
-    filasTraz.forEach((f) => porId.set(f.effi_id, f));
-    const filasTrazUnicas = Array.from(porId.values());
-    if (filasTrazUnicas.length !== filasTraz.length) {
-      console.warn(`[traz] deduplicadas ${filasTraz.length - filasTrazUnicas.length} filas repetidas por effi_id antes de guardar`);
-    }
-    // Mandar ~2600 filas en un solo upsert parece tumbar el proceso (log
-    // termina en seco, sin error de JS ni de Postgres — huele a OOM del
-    // contenedor armando/serializando un payload grande de una sola vez).
-    // Se parte en lotes chicos: baja el pico de memoria y, si un lote
-    // falla, los demás igual se guardan.
-    const TAMANO_LOTE = 300;
-    let guardadas = 0, lotesConError = 0;
-    for (let i = 0; i < filasTrazUnicas.length; i += TAMANO_LOTE) {
-      const lote = filasTrazUnicas.slice(i, i + TAMANO_LOTE);
-      const { error: errorTraz } = await sb
-        .from("effi_trazabilidad_dinero")
-        .upsert(lote, { onConflict: "cliente_nit,effi_id" });
-      if (errorTraz) {
-        lotesConError++;
-        console.error(`[traz] error guardando lote ${i}-${i + lote.length}:`, errorTraz);
-      } else {
-        guardadas += lote.length;
-      }
-    }
-    console.log(`[traz] guardado: ${guardadas}/${filasTrazUnicas.length} filas` + (lotesConError ? ` (${lotesConError} lote(s) con error)` : ""));
-  }
+  return { filas };
+}
 
-  return { filas, filasTraz };
+// --- proceso trazabilidad de dinero: login propio + guarda por medio ---
+async function extraerYGuardarTrazabilidad() {
+  const browser = await chromium.launch({ args: ["--no-sandbox"] });
+  const page = await browser.newPage();
+  let total = 0;
+  try {
+    await login(page);
+    total = await extraerTrazabilidadDinero(page); // ya guarda incrementalmente por medio
+  } finally {
+    await browser.close();
+  }
+  return total;
 }
 
 // --- servidor con el endpoint que dispara el botón ---
@@ -385,8 +405,21 @@ app.post("/extraer", async (req, res) => {
   const anio = req.body?.anio || new Date().getFullYear();
   const hastaMes = req.body?.hastaMes || (new Date().getMonth() + 1);
   try {
-    const { filas, filasTraz } = await extraer({ anio, hastaMes });
-    res.json({ ok: true, registros: filas.length, filas, registrosTraz: filasTraz.length, filasTraz });
+    const { filas } = await extraer({ anio, hastaMes });
+    res.json({ ok: true, registros: filas.length, filas });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// Trazabilidad de dinero — endpoint SEPARADO de /extraer a propósito (ver
+// nota en extraer()): el botón "Actualizar Effi" del frontend llama a los
+// dos, uno tras otro, pero cada petición HTTP se mantiene corta por sí sola.
+app.post("/extraer-trazabilidad", async (_req, res) => {
+  try {
+    const registrosTraz = await extraerYGuardarTrazabilidad();
+    res.json({ ok: true, registrosTraz });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: String(e.message || e) });
