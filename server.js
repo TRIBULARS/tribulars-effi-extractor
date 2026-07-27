@@ -96,7 +96,20 @@ async function seleccionarChosen(page, selectId, subTexto) {
 }
 
 async function aplicarFiltros(page) {
-  const btn = page.locator("button, a").filter({ hasText: /aplicar filtros/i }).first();
+  // getByRole cubre <button>, <a role=button> Y <input type=submit/button
+  // value="..."> (el texto en un <input> vive en el atributo value, no como
+  // textContent — por eso locator('button,a').filter({hasText}) no lo veía).
+  let btn = page.getByRole("button", { name: /aplicar filtros/i }).first();
+  if (!(await btn.count())) {
+    // Respaldo: filter({hasText}) no matchea <input> (su texto vive en
+    // value, no en textContent) — buscar por el atributo value a mano.
+    const inputs = page.locator('input[type="submit"], input[type="button"]');
+    const n = await inputs.count();
+    for (let i = 0; i < n; i++) {
+      const val = await inputs.nth(i).getAttribute("value").catch(() => null);
+      if (val && /aplicar filtros/i.test(val)) { btn = inputs.nth(i); break; }
+    }
+  }
   await btn.click({ timeout: 10000 });
   await page.waitForTimeout(2000);
 }
