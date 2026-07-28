@@ -261,15 +261,43 @@ async function guardarTrazEnLotes(filas, etiqueta) {
 // corta a mitad de camino (timeout de plataforma, lo que parece estar
 // pasando con lotes grandes en una sola petición), lo ya scrapeado no se
 // pierde — queda guardado antes de intentar el siguiente medio.
+// Diagnóstico único: lista todos los <select> de la página con su id/name
+// y las primeras opciones. Para encontrar el id real de "Ingreso | Egreso"
+// (nunca lo confirmamos — probablemente por eso los totales salen inflados,
+// sumando egresos junto con ingresos) sin tener que adivinar a ciegas.
+async function volcarSelectsDisponibles(page) {
+  try {
+    const info = await page.locator("select").evaluateAll((selects) =>
+      selects.map((s) => ({
+        id: s.id || null,
+        name: s.name || null,
+        opciones: Array.from(s.options).slice(0, 6).map((o) => o.textContent.trim())
+      }))
+    );
+    console.log("[traz] selects disponibles en la página:", JSON.stringify(info));
+  } catch (e) {
+    console.warn("[traz] no pude volcar los selects de la página:", e.message);
+  }
+}
+
+// TODO: confirmar el id real del filtro "Ingreso | Egreso" (ver volcarSelectsDisponibles
+// en el log) y agregar el mismo tipo de filtro que vigencia_trans/medio_pago para
+// quedarnos solo con "Ingreso" — hoy probablemente se están sumando también los egresos.
 async function extraerTrazabilidadDinero(page) {
   const TRAZ_URL = "https://effi.com.co/app/trazabilidad_dinero"; // confirmado por logs 2026-07-27 (encontró #medio_pago y #vigencia_trans en esta ruta)
   let totalEncontradas = 0;
+  let diagnosticoHecho = false;
 
   for (const { buscar, guardar } of TRAZ_MEDIOS_PERMITIDOS) {
     await page.goto(TRAZ_URL, { waitUntil: "networkidle", timeout: 60000 }).catch((e) => {
       console.warn(`[traz] no pude navegar a ${TRAZ_URL}: ${e.message}`);
     });
     await page.waitForTimeout(1500);
+
+    if (!diagnosticoHecho) {
+      await volcarSelectsDisponibles(page);
+      diagnosticoHecho = true;
+    }
 
     const okVigencia = await seleccionarChosen(page, "vigencia_trans", TRAZ_VIGENCIA_VALOR);
     const okMedio = await seleccionarChosen(page, "medio_pago", buscar);
